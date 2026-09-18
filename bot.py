@@ -3,10 +3,12 @@ import re
 import asyncio
 import threading
 import time
+import tempfile
 import requests
 
 from flask import Flask, jsonify
-from telegram import Update
+from mutagen.mp3 import MP3
+from telegram import Update, InputFile
 from telegram.ext import (
     Application,
     CommandHandler,
@@ -14,6 +16,7 @@ from telegram.ext import (
     ContextTypes,
     filters,
 )
+from telegram.constants import ParseMode
 
 from messages import (
     START_TEXT,
@@ -22,6 +25,7 @@ from messages import (
     EMPTY_QUERY_TEXT,
     NOT_FOUND_TEXT,
     HINT_TEXT,
+    ALTERNATIVES_HEADER,
 )
 
 
@@ -115,6 +119,7 @@ def search_itunes(query, limit=5):
 
 
 def search_deezer(query, limit=5):
+    """Deezer — основной источник: даёт mp3-preview и обложку."""
     results = []
     try:
         r = requests.get(
@@ -134,7 +139,12 @@ def search_deezer(query, limit=5):
                 "trackName": title,
                 "collectionName": item.get("album", {}).get("title", ""),
                 "trackViewUrl": item.get("link", ""),
+                "previewUrl": item.get("preview", ""),
+                "coverUrl": (item.get("album") or {}).get("cover_big")
+                             or (item.get("album") or {}).get("cover_medium")
+                             or (item.get("album") or {}).get("cover", ""),
                 "releaseDate": item.get("release_date", ""),
+                "duration": item.get("duration", 0),
                 "source": "Deezer",
             })
     except Exception:
@@ -145,6 +155,26 @@ def search_deezer(query, limit=5):
 def merge_results(itunes, deezer):
     out = []
     seen = set()
+
+    # Сначала Deezer — у него есть mp3-preview
+    for item in deezer:
+        artist = (item.get("artistName") or "").strip().lower()
+        title = (item.get("trackName") or "").strip().lower()
+        key = (artist, title)
+        if not artist or not title or key in seen:
+            continue
+        seen.add(key)
+        out.append({
+            "artist": item.get("artistName", ""),
+            "title": item.get("trackName", ""),
+            "album": item.get("collectionName", ""),
+            "link": item.get("trackViewUrl", ""),
+            "release": item.get("releaseDate", ""),
+            "previewUrl": item.get("previewUrl", ""),
+            "coverUrl": item.get("coverUrl", ""),
+            "duration": item.get("duration", 0),
+            "source": "Deezer",
+        })
 
     for item in itunes:
         artist = (item.get("artistName") or "").strip().lower()
@@ -159,23 +189,11 @@ def merge_results(itunes, deezer):
             "album": item.get("collectionName", ""),
             "link": item.get("trackViewUrl", ""),
             "release": (item.get("releaseDate") or "")[:10],
+            "previewUrl": item.get("previewUrl", ""),
+            "coverUrl": (item.get("artworkUrl100") or "")
+ .replace("100x100bb", "600x600bb"),
+            "duration": (item.get("trackTimeMillis") or 0) // 1000,
             "source": "iTunes",
-        })
-
-    for item in deezer:
-        artist = (item.get("artistName") or "").strip().lower()
-        title = (item.get("trackName") or "").strip().lower()
-        key = (artist, title)
-        if not artist or not title or key in seen:
-            continue
-        seen.add(key)
-        out.append({
-            "artist": item.get("artistName", ""),
-            "title": item.get("trackName", ""),
-            "album": item.get("collectionName", ""),
-            "link": item.get("trackViewUrl", ""),
-            "release": item.get("releaseDate", ""),
-            "source": "Deezer",
         })
 
     return out
@@ -203,40 +221,41 @@ def detect_version_tags(title):
     return tags
 
 
-def format_results(results, query):
-    if not results:
-        return NOT_FOUND_TEXT
+def download_file(url, timeout=30):
+    """Скачивает файл по URL, возвращает байты или None."""
+    if not url:
+        return None
+    try:
+        r = requests.get(url, timeout=timeout, stream=True)
+        r.raise_for_status()
+        return r.content
+    except Exception:
+        return None
 
-    main = results[0]
-    rest = results[1:]
 
-    lines = []
-    lines.append(f"🎵 {main['artist']} — {main['title']}")
+def get_mp3_duration(audio_bytes):
+    """Считает длительность mp3 в секундах через mutagen."""
+    if not audio_bytes:
+        return 0
+    try:
+        with tempfile.NamedTemporaryFile(suffix=".mp3", delete=True) as f:
+            f.write(audio_bytes)
+            f.flush()
+            audio = MP3(f.name)
+            return int(audio.info.length)
+    except Exception:
+        return 0
 
-    if main.get("album"):
-        lines.append(f"💿 Альбом: {main['album']}")
-    if main.get("release"):
-        lines.append(f"📅 Дата выхода: {main['release']}")
 
-    tags = detect_version_tags(main["title"])
-    if tags:
-        lines.append(f"🎧 Версия: {', '.join(tags)}")
-
+def format_alternatives(rest):
+    """Текст со списком альтернатив под аудио."""
+    if not rest:
+        return ""
+    lines = ["", ALTERNATIVES_HEADER]
+    for i, item in enumerate(rest[:4], start=2):
+        lines.append(f"{i}️⃣ {item['artist']} — {item['title']}")
     lines.append("")
-    lines.append("🔥 Найдено точно")
-
-    if main.get("link"):
-        lines.append(f"🔗 {main['link']}")
-
-    if rest:
-        lines.append("")
-        lines.append("🤔 Другие варианты:")
-        for i, item in enumerate(rest[:4], start=2):
-            lines.append(f"{i}️⃣ {item['artist']} — {item['title']}")
-
-        lines.append("")
-        lines.append(HINT_TEXT)
-
+    lines.append(HINT_TEXT)
     return "\n".join(lines)
 
 
@@ -269,8 +288,64 @@ async def do_search(update, query):
     deezer = search_deezer(query)
     merged = merge_results(itunes, deezer)
 
-    text = format_results(merged, query)
-    await msg.edit_text(text)
+    if not merged:
+        await msg.edit_text(NOT_FOUND_TEXT)
+        return
+
+    main = merged[0]
+    rest = merged[1:]
+
+    # Скачиваем mp3-preview
+    audio_bytes = None
+    if main.get("previewUrl"):
+        audio_bytes = download_file(main["previewUrl"])
+
+    # Скачиваем обложку
+    thumb_bytes = None
+    if main.get("coverUrl"):
+        thumb_bytes = download_file(main["coverUrl"])
+
+    tags = detect_version_tags(main["title"])
+    caption_lines = [
+        f"🎵 {main['artist']} — {main['title']}",
+    ]
+    if main.get("album"):
+        caption_lines.append(f"💿 {main['album']}")
+    if tags:
+        caption_lines.append(f"🎧 {', '.join(tags)}")
+    caption = "\n".join(caption_lines)
+
+    try:
+        await msg.delete()
+    except Exception:
+        pass
+
+    if audio_bytes:
+        try:
+            duration = get_mp3_duration(audio_bytes) or main.get("duration") or 30
+            await update.message.reply_audio(
+                audio=audio_bytes,
+                filename=f"{main['artist']} - {main['title']}.mp3",
+                title=main["title"],
+                performer=main["artist"],
+                duration=duration,
+                thumbnail=thumb_bytes,
+                caption=caption,
+                parse_mode=ParseMode.HTML,
+            )
+        except Exception:
+            await update.message.reply_text(
+                f"⚠️ Не получилось отправить аудио.\n\n{caption}"
+            )
+    else:
+        await update.message.reply_text(
+            f"⚠️ Превью недоступно.\n\n{caption}"
+        )
+
+    # Альтернативы — отдельным сообщением
+    alt_text = format_alternatives(rest)
+    if alt_text:
+        await update.message.reply_text(alt_text)
 
 
 async def handle_text(update, context):
