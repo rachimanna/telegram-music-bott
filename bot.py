@@ -1,5 +1,6 @@
 import os
 import re
+import asyncio
 import threading
 import time
 import requests
@@ -48,7 +49,7 @@ def health():
 
 def run_web_server():
     port = int(os.environ.get("PORT", 10000))
-    app_web.run(host="0.0.0.0", port=port)
+    app_web.run(host="0.0.0.0", port=port, use_reloader=False)
 
 
 def contains_trigger(text):
@@ -68,7 +69,7 @@ def extract_query(text):
     m = TRIGGER_RE.search(lower)
     if not m:
         return None
-    after = text[m.end():].strip(" ,.;:\n\t")
+    after = text[m.end():].strip($" ,.;:\n\t"$)
     return after or None
 
 
@@ -245,94 +246,4 @@ async def start_command(update, context):
         "Как использовать:\n"
         "1) Напиши «найти песню Моника»\n"
         "2) Или напиши «найти песню» — следующим сообщением пришли название/исполнителя\n"
-        "3) Я дам ссылку на трек 🔎\n\n"
-        "Триггеры:\n"
-        "• найти песню\n"
-        "• найди песню\n"
-        "• что за песня\n"
-        "• что за трек\n"
-        "• название песни\n"
-        "• помоги найти песню\n"
-        "• /find"
-    )
-
-
-async def find_command(update, context):
-    if context.args:
-        query = " ".join(context.args).strip()
-        await do_search(update, query)
-    else:
-        context.user_data["waiting_query"] = True
-        await update.message.reply_text(
-            "🔎 Напиши название или исполнителя следующим сообщением."
-        )
-
-
-async def cancel_command(update, context):
-    context.user_data.pop("waiting_query", None)
-    await update.message.reply_text("Окей, отменил.")
-
-
-async def do_search(update, query):
-    if not query:
-        await update.message.reply_text(
-            "Напиши название или исполнителя.\n"
-            "Пример:\n"
-            "найти песню Моника"
-        )
-        return
-
-    msg = await update.message.reply_text(f"🔎 Ищу: {query}…")
-
-    itunes = search_itunes(query)
-    deezer = search_deezer(query)
-    merged = merge_results(itunes, deezer)
-
-    text = format_results(merged, query)
-    await msg.edit_text(text)
-
-
-async def handle_text(update, context):
-    if not update.message or not update.message.text:
-        return
-
-    text = update.message.text.strip()
-    chat_type = update.effective_chat.type
-
-    if chat_type in ("group", "supergroup"):
-        if not contains_trigger(text):
-            return
-
-    query = extract_query(text)
-
-    if query:
-        await do_search(update, query)
-        return
-
-    if context.user_data.get("waiting_query"):
-        context.user_data.pop("waiting_query", None)
-        await do_search(update, text)
-        return
-
-
-def main():
-    if not BOT_TOKEN:
-        raise RuntimeError("Не найден BOT_TOKEN")
-
-    threading.Thread(target=run_web_server, daemon=True).start()
-
-    application = Application.builder().token(BOT_TOKEN).build()
-
-    application.add_handler(CommandHandler("start", start_command))
-    application.add_handler(CommandHandler("find", find_command))
-    application.add_handler(CommandHandler("cancel", cancel_command))
-    application.add_handler(MessageHandler(
-        filters.TEXT & ~filters.COMMAND,
-        handle_text,
-    ))
-
-    application.run_polling()
-
-
-if __name__ == "__main__":
-    main()
+        "3) Я д
